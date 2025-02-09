@@ -34,3 +34,5 @@ Este projeto implementa um fluxo automatizado para análise de ações utilizand
 
 ### 8. Agendamento
 - O fluxo é executado diariamente às 22h (UTC) usando um agendador Cron.
+
+![alt text](image.png)
