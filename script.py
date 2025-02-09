@@ -1,12 +1,31 @@
-import os
-import datetime
-import pandas as pd
 import yfinance as yf
-from prefect import flow, task, get_run_logger
+import pandas as pd
+import matplotlib.pyplot as plt
+from prefect import task, flow, get_run_logger
 from prefect.artifacts import create_table_artifact
+from prefect.tasks import task_input_hash
+from datetime import datetime, timedelta
+from prefect.blocks.system import Secret
+from prefect.filesystems import GitHub
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+import os
+import pickle
+import subprocess
 
-# Lista de tickers – em produção, esta lista pode ser armazenada em um Block do Prefect (Variável)
-TICKERS = [
+# Configuração do GitHub Block
+github_block = GitHub.load("github-repo")
+
+def commit_and_push_changes():
+    subprocess.run(["git", "add", "*"], check=True)
+    subprocess.run(["git", "commit", "-m", "Atualização automática pelo Prefect"], check=True)
+    subprocess.run(["git", "push"], check=True)
+
+# Tickers
+tickers = [
     "ABEV3.SA", "ALPA4.SA", "AMER3.SA", "ARZZ3.SA", "ASAI3.SA", "AZUL4.SA",
     "B3SA3.SA", "BBAS3.SA", "BBDC3.SA", "BBDC4.SA", "BBSE3.SA", "BEEF3.SA",
     "BPAC11.SA", "BPAN4.SA", "BRAP4.SA", "BRFS3.SA", "BRKM5.SA", "BRML3.SA",
@@ -25,134 +44,113 @@ TICKERS = [
     "VVAR3.SA", "WEGE3.SA", "YDUQ3.SA"
 ]
 
-@task(retries=3, retry_delay_seconds=10, log_prints=True)
-def fetch_stock_data(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """
-    Coleta os dados de um ticker utilizando a API do Yahoo Finance.
-    Em caso de falha, a tarefa será reexecutada (retry).
-    """
-    logger = get_run_logger()
-    logger.info(f"Iniciando coleta de dados para {ticker}")
-    try:
-        data = yf.download(ticker, start=start_date, end=end_date)
-        if data.empty:
-            logger.warning(f"Nenhum dado encontrado para {ticker}")
+# Autenticação no Google Drive
+def authenticate_google_drive():
+    SCOPES = ['https://www.googleapis.com/auth/drive']
+    creds = None
+    if os.path.exists('token.pickle'):
+        with open('token.pickle', 'rb') as token:
+            creds = pickle.load(token)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
         else:
-            data.reset_index(inplace=True)
-            data["Ticker"] = ticker
-            logger.info(f"Dados coletados para {ticker} com sucesso.")
+            flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open('token.pickle', 'wb') as token:
+            pickle.dump(creds, token)
+    return build('drive', 'v3', credentials=creds)
+
+@task(retries=3, retry_delay_seconds=10, cache_key_fn=task_input_hash)
+def fetch_stock_data(ticker):
+    logger = get_run_logger()
+    try:
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=7)
+        data = yf.download(ticker, start=start_date, end=end_date)
+        logger.info(f"Data fetched successfully for {ticker}")
         return data
     except Exception as e:
-        logger.error(f"Erro ao coletar dados para {ticker}: {e}")
+        logger.error(f"Error fetching data for {ticker}: {e}")
         raise
 
-@task(log_prints=True)
-def process_stock_data(data: pd.DataFrame) -> pd.DataFrame:
-    """
-    Processa os dados coletados:
-     - Calcula média móvel de 5 períodos para o fechamento
-     - Calcula retornos diários e volatilidade (desvio padrão dos retornos)
-    """
-    logger = get_run_logger()
-    if data.empty:
-        logger.warning("Dados vazios para processar.")
-        return data
-    data["Close_MA5"] = data["Close"].rolling(window=5).mean()
-    data["Return"] = data["Close"].pct_change()
-    data["Volatility"] = data["Return"].rolling(window=5).std()
-    logger.info("Processamento dos dados concluído.")
+@task
+def calculate_indicators(data):
+    data['MA'] = data['Close'].rolling(window=5).mean()
+    data['Volatility'] = data['Close'].rolling(window=5).std()
     return data
 
-@task(log_prints=True)
-def save_daily_data(all_data: pd.DataFrame):
-    """
-    Salva os dados dos últimos 7 dias particionados por dia em arquivos CSV.
-    Os arquivos são salvos na pasta 'data', com o nome no formato YYYY-MM-DD.csv.
-    """
+@task
+def save_daily_data(data, ticker):
     logger = get_run_logger()
-    output_folder = "data"
-    os.makedirs(output_folder, exist_ok=True)
-    
-    if not pd.api.types.is_datetime64_any_dtype(all_data["Date"]):
-        all_data["Date"] = pd.to_datetime(all_data["Date"])
-    
-    for day, group in all_data.groupby(all_data["Date"].dt.date):
-        filename = os.path.join(output_folder, f"{day}.csv")
-        group.to_csv(filename, index=False)
-        logger.info(f"Dados do dia {day} salvos em {filename}.")
+    try:
+        today = datetime.now().strftime('%Y-%m-%d')
+        filename = f"{ticker}_{today}.csv"
+        data.to_csv(filename)
+        logger.info(f"Data saved locally as {filename}")
+        return filename
+    except Exception as e:
+        logger.error(f"Error saving data for {ticker}: {e}")
+        raise
 
-@task(log_prints=True)
-def generate_daily_report(all_data: pd.DataFrame):
-    """
-    Gera um relatório simples baseado nos dados do último dia disponível.
-    Calcula a variação percentual dos fechamentos e identifica:
-     - Top 3 ações em alta
-     - Top 3 ações em baixa
-    Além disso, registra o resultado utilizando um artifact table do Prefect.
-    """
+@task
+def upload_to_google_drive(filename):
     logger = get_run_logger()
-    all_data["Date"] = pd.to_datetime(all_data["Date"])
-    last_date = all_data["Date"].max().date()
-    data_last_day = all_data[all_data["Date"].dt.date == last_date]
+    try:
+        drive_service = authenticate_google_drive()
+        file_metadata = {'name': filename}
+        media = MediaFileUpload(filename, mimetype='text/csv')
+        file = drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+        logger.info(f"File {filename} uploaded to Google Drive with ID: {file.get('id')}")
+    except Exception as e:
+        logger.error(f"Error uploading {filename} to Google Drive: {e}")
+        raise
+
+@task
+def generate_report(data, ticker):
+    plt.figure(figsize=(10, 5))
+    plt.plot(data['Close'], label='Close Price')
+    plt.plot(data['MA'], label='Moving Average')
+    plt.title(f"{ticker} Stock Price")
+    plt.legend()
+    plt.savefig(f"{ticker}_report.png")
+    plt.close()
+
+@task
+def log_top_movers(data):
+    data['Daily_Return'] = data['Close'].pct_change()
+    top_gainers = data.nlargest(3, 'Daily_Return')
+    top_losers = data.nsmallest(3, 'Daily_Return')
     
-    # Cálculo da variação percentual dos fechamentos para cada ticker
-    data_last_day = data_last_day.copy()
-    data_last_day["Pct_Change"] = data_last_day.groupby("Ticker")["Close"].pct_change()
-    data_last_day = data_last_day.dropna(subset=["Pct_Change"])
-    
-    top_gainers = data_last_day.sort_values("Pct_Change", ascending=False).head(3)
-    top_losers = data_last_day.sort_values("Pct_Change", ascending=True).head(3)
-    
-    report = f"Relatório Diário - {last_date}\n\n"
-    report += "Top 3 Ações em Alta:\n"
-    report += top_gainers[["Ticker", "Pct_Change"]].to_string(index=False) + "\n\n"
-    report += "Top 3 Ações em Baixa:\n"
-    report += top_losers[["Ticker", "Pct_Change"]].to_string(index=False)
-    
-    logger.info("Relatório diário gerado com sucesso:\n" + report)
-    
-    # Registro do artifact com os dados das ações
-    table_data = pd.concat([top_gainers, top_losers])
     create_table_artifact(
-        key="daily_top_stocks",
-        table=table_data,
-        description="Top 3 ações que mais subiram e top 3 que mais desceram no último dia."
+        key="top-movers",
+        table={
+            "columns": ["Ticker", "Date", "Daily Return"],
+            "data": [
+                [ticker, date, return_value]
+                for ticker, date, return_value in zip(top_gainers.index, top_gainers['Daily_Return'])
+            ]
+        }
     )
-    return report
 
-@flow(name="Workflow de Ações - Prefect")
-def stock_data_flow():
-    """
-    Fluxo principal que:
-     1. Define o intervalo (últimos 7 dias)
-     2. Coleta e processa os dados para cada ticker
-     3. Salva os dados particionados por dia
-     4. Gera um relatório diário e registra os artifacts
-    """
-    logger = get_run_logger()
-    end_date = datetime.date.today() + datetime.timedelta(days=1)
-    start_date = end_date - datetime.timedelta(days=7)
-    start_date_str = start_date.strftime("%Y-%m-%d")
-    end_date_str = end_date.strftime("%Y-%m-%d")
-    
-    logger.info(f"Coletando dados de {start_date_str} até {end_date_str}")
-    
-    all_stock_data = []
-    for ticker in TICKERS:
-        data = fetch_stock_data(ticker, start_date_str, end_date_str)
-        processed_data = process_stock_data(data)
-        all_stock_data.append(processed_data)
-    
-    if all_stock_data:
-        combined_data = pd.concat(all_stock_data, ignore_index=True)
-    else:
-        logger.error("Nenhum dado coletado para nenhum ticker.")
-        return
-    
-    save_daily_data(combined_data)
-    report = generate_daily_report(combined_data)
-    logger.info("Workflow concluído com sucesso.")
-    return report
+@flow(name="Stock Analysis Workflow")
+def stock_analysis_flow():
+    for ticker in tickers:
+        data = fetch_stock_data(ticker)
+        data = calculate_indicators(data)
+        filename = save_daily_data(data, ticker)
+        upload_to_google_drive(filename)
+        generate_report(data, ticker)
+        log_top_movers(data)
+    commit_and_push_changes()
 
-if __name__ == '__main__':
-    stock_data_flow()
+from prefect import flow
+
+if __name__ == "__main__":
+    flow.from_source(
+        source=github_block,
+        entrypoint="script.py:stock_analysis_flow",
+    ).deploy(
+        name="daily-stock-analysis",
+        work_pool_name="tvc2",
+    )
