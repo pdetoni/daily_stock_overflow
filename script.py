@@ -3,10 +3,11 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from prefect import task, flow, get_run_logger
 from prefect.artifacts import create_table_artifact
+from prefect.schedules import Cron
 from prefect.tasks import task_input_hash
 from datetime import datetime, timedelta
 from prefect.blocks.system import Secret
-from prefect.filesystems import GitHub
+from prefect_github import GitHubRepository
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
@@ -16,15 +17,19 @@ import os
 import pickle
 import subprocess
 
-# Configuração do GitHub Block
-github_block = GitHub.load("github-repo")
+github_block = GitHubRepository(
+    name="tvc2-repo",
+    repository_url="https://github.com/pdetoni/daily_stock_overflow.git",
+    reference="main"
+)
+github_block.save("tvc2-repo", overwrite=True)
 
 def commit_and_push_changes():
     subprocess.run(["git", "add", "*"], check=True)
     subprocess.run(["git", "commit", "-m", "Atualização automática pelo Prefect"], check=True)
     subprocess.run(["git", "push"], check=True)
 
-# Tickers
+
 tickers = [
     "ABEV3.SA", "ALPA4.SA", "AMER3.SA", "ARZZ3.SA", "ASAI3.SA", "AZUL4.SA",
     "B3SA3.SA", "BBAS3.SA", "BBDC3.SA", "BBDC4.SA", "BBSE3.SA", "BEEF3.SA",
@@ -44,7 +49,7 @@ tickers = [
     "VVAR3.SA", "WEGE3.SA", "YDUQ3.SA"
 ]
 
-# Autenticação no Google Drive
+
 def authenticate_google_drive():
     SCOPES = ['https://www.googleapis.com/auth/drive']
     creds = None
@@ -85,7 +90,9 @@ def save_daily_data(data, ticker):
     logger = get_run_logger()
     try:
         today = datetime.now().strftime('%Y-%m-%d')
-        filename = f"{ticker}_{today}.csv"
+        data_folder = os.path.join("data", today)
+        os.makedirs(data_folder, exist_ok=True)
+        filename = os.path.join(data_folder, f"{ticker}_{today}.csv")
         data.to_csv(filename)
         logger.info(f"Data saved locally as {filename}")
         return filename
@@ -98,7 +105,7 @@ def upload_to_google_drive(filename):
     logger = get_run_logger()
     try:
         drive_service = authenticate_google_drive()
-        file_metadata = {'name': filename}
+        file_metadata = {'name': os.path.basename(filename)}
         media = MediaFileUpload(filename, mimetype='text/csv')
         file = drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
         logger.info(f"File {filename} uploaded to Google Drive with ID: {file.get('id')}")
@@ -113,22 +120,26 @@ def generate_report(data, ticker):
     plt.plot(data['MA'], label='Moving Average')
     plt.title(f"{ticker} Stock Price")
     plt.legend()
-    plt.savefig(f"{ticker}_report.png")
+    today = datetime.now().strftime('%Y-%m-%d')
+    data_folder = os.path.join("data", today)
+    os.makedirs(data_folder, exist_ok=True)
+    plt.savefig(os.path.join(data_folder, f"{ticker}_report.png"))
     plt.close()
 
 @task
-def log_top_movers(data):
+def log_top_movers(data, ticker):
     data['Daily_Return'] = data['Close'].pct_change()
     top_gainers = data.nlargest(3, 'Daily_Return')
     top_losers = data.nsmallest(3, 'Daily_Return')
     
+    # Convert Timestamp to string for JSON serialization
     create_table_artifact(
         key="top-movers",
         table={
             "columns": ["Ticker", "Date", "Daily Return"],
             "data": [
-                [ticker, date, return_value]
-                for ticker, date, return_value in zip(top_gainers.index, top_gainers['Daily_Return'])
+                [ticker, date.strftime('%Y-%m-%d'), return_value]
+                for date, return_value in zip(top_gainers.index, top_gainers['Daily_Return'])
             ]
         }
     )
@@ -141,16 +152,14 @@ def stock_analysis_flow():
         filename = save_daily_data(data, ticker)
         upload_to_google_drive(filename)
         generate_report(data, ticker)
-        log_top_movers(data)
+        log_top_movers(data, ticker) 
     commit_and_push_changes()
 
-from prefect import flow
 
 if __name__ == "__main__":
-    flow.from_source(
-        source=github_block,
-        entrypoint="script.py:stock_analysis_flow",
-    ).deploy(
+    stock_analysis_flow().deploy(
         name="daily-stock-analysis",
         work_pool_name="tvc2",
+        job_variables={"pip_packages": ["yfinance", "pandas", "matplotlib", "google-auth", "google-auth-oauthlib", "google-auth-httplib2", "google-api-python-client", "oauthlib", "requests", "prefect-github", "google-auth-oauthlib", "google-auth-httplib2", "google-api-python-client", "oauthlib", "requests"]},
+        schedules = [Cron("0 22 * * *")]
     )
